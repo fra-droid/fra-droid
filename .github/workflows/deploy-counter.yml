@@ -1,0 +1,124 @@
+name: deploy counter
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-counter
+  cancel-in-progress: false
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This repo is public, so its Actions logs are world-readable.
+      # Nothing below may print a repository name. Counts only.
+      - name: Count deployments
+        id: count
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_COUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::DEPLOY_COUNT_TOKEN is not set"
+            exit 1
+          fi
+
+          repos="$(gh api user/repos --paginate \
+            --jq '.[] | select(.owner.login == "fra-droid") | .full_name')"
+          if [ -z "$repos" ]; then
+            echo "::error::repo listing returned nothing"
+            exit 1
+          fi
+
+          total=0
+          while IFS= read -r repo; do
+            [ -n "$repo" ] || continue
+            n="$(gh api "repos/$repo/deployments?per_page=100" --paginate \
+              --jq 'length' | awk '{s += $1} END {print s + 0}')"
+            case "$n" in
+              ''|*[!0-9]*) echo "::error::non-numeric count"; exit 1 ;;
+            esac
+            total=$((total + n))
+          done <<< "$repos"
+
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+          echo "counted $total deployments"
+
+      - name: Rewrite badge, with guards
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_COUNT_TOKEN }}
+          TOTAL: ${{ steps.count.outputs.total }}
+        run: |
+          set -euo pipefail
+
+          case "$TOTAL" in
+            ''|*[!0-9]*) echo "::error::total is not an integer"; exit 1 ;;
+          esac
+
+          python3 - <<'PY'
+          import os, re, pathlib, sys
+          total = os.environ["TOTAL"]
+          if not re.fullmatch(r"[0-9]+", total):
+              sys.exit("total is not an integer")
+          p = pathlib.Path("README.md")
+          text = p.read_text()
+          pattern = r"(img\.shields\.io/badge/deploys-)[0-9]+(-)"
+          out, n = re.subn(pattern, lambda m: m.group(1) + total + m.group(2), text)
+          if n != 1:
+              sys.exit("expected exactly one deploys badge, found %d" % n)
+          p.write_text(out)
+          PY
+
+          if git diff --quiet -- README.md; then
+            echo "unchanged at $TOTAL, nothing to commit"
+            exit 0
+          fi
+
+          added="$(git diff -U0 -- README.md | grep -c '^+[^+]' || true)"
+          removed="$(git diff -U0 -- README.md | grep -c '^-[^-]' || true)"
+          if [ "$added" != "1" ] || [ "$removed" != "1" ]; then
+            echo "::error::guard tripped: diff touches more than the badge line"
+            exit 1
+          fi
+
+          if ! git diff -U0 -- README.md | grep '^+[^+]' | grep -qE \
+            '^\+!\[deploys\]\(https://img\.shields\.io/badge/deploys-[0-9]+-555\)$'; then
+            echo "::error::guard tripped: changed line is not the badge"
+            exit 1
+          fi
+
+          diff_text="$(git diff -- README.md)"
+
+          if printf '%s' "$diff_text" | grep -qE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_'; then
+            echo "::error::guard tripped: credential-shaped string in diff"
+            exit 1
+          fi
+
+          # Private repo names must never reach the public README. Compared,
+          # never printed: a match aborts without naming what matched.
+          private="$(gh api user/repos --paginate \
+            --jq '.[] | select(.owner.login == "fra-droid") | select(.private) | .name')"
+          lower_diff="$(printf '%s' "$diff_text" | tr '[:upper:]' '[:lower:]')"
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            lower_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+            case "$lower_diff" in
+              *"$lower_name"*)
+                echo "::error::guard tripped: private repo name would be exposed"
+                exit 1 ;;
+            esac
+          done <<< "$private"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Update deploy count to $TOTAL"
+          git push

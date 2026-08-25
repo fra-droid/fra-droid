@@ -1,5 +1,7 @@
 # A marketer with a terminal open 👋
 
+![deploys](https://img.shields.io/badge/deploys-60-555)
+
 Fractional Head of Marketing & Growth for early and mid-stage startups.
 Ten years in paid media, budgets in the millions. Strategy and the doing, both.
 
