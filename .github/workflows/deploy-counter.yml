@@ -20,7 +20,7 @@ jobs:
 
       # This repo is public, so its Actions logs are world-readable.
       # Nothing below may print a repository name. Counts only.
-      - name: Count deployments
+      - name: Count pushes to default branches
         id: count
         env:
           GH_TOKEN: ${{ secrets.DEPLOY_COUNT_TOKEN }}
@@ -31,18 +31,25 @@ jobs:
             exit 1
           fi
 
+          # Forks are skipped, and so is this repo: the badge commit is itself
+          # a push, so counting it would bump the total every week.
           repos="$(gh api user/repos --paginate \
-            --jq '.[] | select(.owner.login == "fra-droid") | .full_name')"
+            --jq '.[] | select(.owner.login == "fra-droid") | select(.fork | not)
+                  | select(.name != "fra-droid") | .full_name + " " + .default_branch')"
           if [ -z "$repos" ]; then
             echo "::error::repo listing returned nothing"
             exit 1
           fi
 
           total=0
-          while IFS= read -r repo; do
+          # Every event that lands code on the default branch counts: push,
+          # force_push, pr_merge, and branch_creation (GitHub logs a branch's
+          # first push that way). Only branch_deletion is excluded.
+          while read -r repo branch; do
             [ -n "$repo" ] || continue
-            n="$(gh api "repos/$repo/deployments?per_page=100" --paginate \
-              --jq 'length' | awk '{s += $1} END {print s + 0}')"
+            n="$(gh api "repos/$repo/activity?ref=refs/heads/$branch&per_page=100" --paginate \
+              --jq '[.[] | select(.activity_type != "branch_deletion")] | length' \
+              | awk '{s += $1} END {print s + 0}')"
             case "$n" in
               ''|*[!0-9]*) echo "::error::non-numeric count"; exit 1 ;;
             esac
@@ -50,7 +57,7 @@ jobs:
           done <<< "$repos"
 
           echo "total=$total" >> "$GITHUB_OUTPUT"
-          echo "counted $total deployments"
+          echo "counted $total pushes"
 
       - name: Rewrite badge, with guards
         env:
